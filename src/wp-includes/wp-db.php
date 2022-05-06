@@ -1348,6 +1348,547 @@ class wpdb {
 	}
 
 	/**
+	 * Used by prepare() to handle implosion specifiers.
+	 *
+	 * This function should not be called directly except in the
+	 * testing of this function. Any production use of this code
+	 * should happen automatically via the prepare method instead
+	 *
+	 * For each implosion specifier ( one of %,d or %,f or %,s ) the
+	 * corresponding argument in the given $args MUST be an array of
+	 * one or more elements. Then the implosion identifier is expanded
+	 * to %d[,%d,...], %f[,%f,...], or %s[,%s,...] as appropriate,
+	 * and the argument is expanded in the $args array.
+	 *
+	 * for example the following:
+	 * prepare_implode( '%s %,d $s', 'hello', array( 1, 2, 3 ), 'world' )
+	 * will return array(
+	 *
+	 *
+	 * @param string $query Query to parse for implosion operators
+	 * @param mixed  ...$args Arguments to query being prepared
+	 *
+	 * @return array {
+	 *     @string $query Replacement for the $query variable to be used
+	 *     @array $args   Replacement for the $args variable to be used
+	 *     @string $error If present then an error occured. If an error
+	 *                    does occur then returned $query and $args should
+	 *                    not be used under any circumstances.
+	 * }
+	 */
+	public function _prepare_implode() {
+
+
+		$valid_specifiers = array( 'b', 'c', 'd', 'e', 'E', 'f', 'F', 'g', 'G', 'h', 'H', 'o', 's', 'u', 'x', 'X', '%' );
+		// ' will be special cased in code because it actually
+		// requires a followup character but it can be anything
+		$valid_flags = array( '-', '+', ' ', '0', "'" );
+
+		$args          = func_get_args();
+		$query         = array_shift( $args );
+		$placeholders  = 0;
+		$args_vsprintf = null; // null means we don't know yet
+
+		if ( 1 !== count( $args ) || ! is_array( $args[0] ) ) {
+			// if there are multiple args this can't be vsprintf style args
+			// slao if the one arg is not an an array this can't be vsprintf style args
+			$args_vsprintf = false;
+		} else {
+			foreach ( $args[0] as $idx => $arg ) {
+				if ( is_array( $arg ) ) {
+					// if any sub-element of this single array argument is, itself, an
+					// array then this has to be vsprintf style args.
+
+					$args_vsprintf = true;
+					break;
+				}
+			}
+			if ( true === $args_vsprintf ) {
+
+				$args          = $args[0];
+				$args_vsprintf = false;
+			}
+		}
+
+
+
+		$len_query           = strlen( $query );
+		$new_query           = '';
+		$current_arg         = 0;
+		$argnum_reassignment = array();
+		$new_args            = array();
+
+		for ( $position = 0; $position < $len_query; $position++ ) {
+			$char = $query[ $position ];
+			if ( '%' !== $char ) {
+
+				$new_query .= $char;
+				continue;
+			}
+
+
+			if ( ( $position + 1 ) >= $len_query ) {
+
+				$new_query .= $char;
+				continue;
+			}
+
+			// The very first character can have signifigance for us. We can tell right away if we are
+			// escaping another % or if we are imploding.
+			$peek_char = $query[ $position + 1 ];
+
+			if ( '%' === $peek_char ) {
+
+				// append our escaped %
+				$new_query .= '%%';
+				// move our string scanning pointer past these 2 characters
+				$position++;
+				// break the current loop and continue the outer loop
+				continue;
+			} elseif ( ',' === $peek_char ) {
+
+
+				$possible_implode_specifier = $query[ $position + 2 ];
+				if ( in_array( $possible_implode_specifier, array( 'd', 'f', 's' ), true ) ) {
+
+					// move our string scanning pointer past these 3 characters
+					$position = $position + 2;
+					if ( ! is_array( $args[ $current_arg ] ) ) {
+
+
+						wp_load_translations_early();
+						_doing_it_wrong(
+							'wpdb::_prepare_implode',
+							sprintf(
+								__( 'The query attempted to implode (%1$s) a non-array (%1$ss).' ),
+								"%,$possible_implode_specifier",
+								var_export( $args[ $current_arg ], true )
+							),
+							'???'
+						);
+						return array( false, false, "attempt to implode a non array value [$current_arg]" );
+					}
+
+					// process the implosion specifier
+					$append = false;
+					foreach ( $args[ $current_arg ] as $value ) {
+						// expand the implosion specifier
+						if ( false === $append ) {
+							$append = "%$possible_implode_specifier";
+						} else {
+							$append .= ",%$possible_implode_specifier";
+						}
+						// expand the arg in the args array
+						$new_args[] = $value;
+					}
+					$new_query .= $append;
+					if ( null === $args_vsprintf ) {
+						// now we know
+
+						$args_vsprintf = false;
+					}
+					// move our argument pointer forward by one
+					$placeholders++;
+					$current_arg++;
+					// break the current loop and continue the outer loop
+					continue;
+				}
+			}
+			// handle the most common case of a simple specifier like %s, %d, etc...
+			if ( in_array( $peek_char, $valid_specifiers, true ) ) {
+
+				// append the referenced argument to the array
+				if ( null === $args_vsprintf ) {
+					// now we know
+
+					$args_vsprintf = true;
+					$args          = $args[0];
+				}
+				$placeholders++;
+				if ( array_key_exists( $current_arg, $args ) ) {
+					$new_args[] = $args[ $current_arg ];
+					$current_arg++;
+				} else {
+					wp_load_translations_early();
+					_doing_it_wrong(
+						'wpdb::_prepare_implode',
+						__( 'too few arguments supplied for the given number of placeholders' ),
+						'???'
+					);
+					return array( $query, $args, 'too few arguments supplied for the given number of placeholders' );
+				}
+				// append the specifier to the new query and advance our string scanning pointer by an extra one
+				$new_query .= $char . $peek_char;
+				$position++;
+				continue;
+			}
+
+
+			// Now things get complicated... I'm sorry.
+			$parser_state = 1 | 2 | 4 | 8 | 16; // argnum | flags | width | precision | specifier
+			$buffer       = '';
+			$argnum_found = false;
+			for ( $i = $position + 1; $i < $len_query; $i++ ) {
+				$parse_char = $query[ $i ];
+				$buffer    .= $parse_char;
+
+				switch ( $parser_state ) {
+					// case 16 (only specifier) is un-handled because it's specially handled as an early
+					// return in all other cases. So there is no case in which we know we are in a
+					// specifier while we know we are not in any other state.
+					case 8 | 16:
+						// this can be precision | specifier
+						if ( in_array( $parse_char, $valid_specifiers, true ) ) {
+
+							// we have reached the end of the road. Append the buffer to the new query.
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							$placeholders++;
+							if ( '%' === $parse_char ) {
+								// this was a really, really, really long winded (but valid) method of escaping a %
+								// no variable is used.
+
+								// for some reason vsprintf needs a placeholder for (as an example) %'%% but not %% 
+								break 2;
+							}
+							if ( false === $argnum_found ) {
+								// append the referenced arg to the new args
+								if ( array_key_exists( $current_arg, $args ) ) {
+									if ( null === $args_vsprintf ) {
+										// now we know
+
+										$args_vsprintf = true;
+										$args          = $args[0];
+									}
+									$new_args[] = $args[ $current_arg ];
+									$current_arg++;
+								} else {
+									wp_load_translations_early();
+									_doing_it_wrong(
+										'wpdb::_prepare_implode',
+										__( 'too few arguments supplied for the given number of placeholders' ),
+										'???'
+									);
+								}
+							}
+							// break the switch and the next outer loop
+							break 2;
+						} elseif ( ctype_digit( $parse_char ) ) {
+							// still precision
+							break;
+						} else {
+							// seems to be invalid. Append the buffer to the new query
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							// break out of this switch and the mini parser
+							break 2;
+						}
+						break;
+					case 4 | 8 | 16:
+						// this can be width | precision | specifier
+						if ( in_array( $parse_char, $valid_specifiers, true ) ) {
+
+							$placeholders++;
+							// we have reached the end of the road. Append the buffer to the new query.
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							if ( '%' === $parse_char ) {
+								// this was a really, really, really long winded (but valid) method of escaping a %
+								// no variable is used.
+
+								// for some reason vsprintf needs a placeholder for (as an example) %'%% but not %% 
+								$placeholders++;
+								break 2;
+							}
+							if ( false === $argnum_found ) {
+								// append the referenced arg to the new args
+								if ( array_key_exists( $current_arg, $args ) ) {
+									if ( null === $args_vsprintf ) {
+										// now we know
+
+										$args_vsprintf = true;
+										$args          = $args[0];
+									}
+									$new_args[] = $args[ $current_arg ];
+									$current_arg++;
+								} else {
+									wp_load_translations_early();
+									_doing_it_wrong(
+										'wpdb::_prepare_implode',
+										__( 'too few arguments supplied for the given number of placeholders' ),
+										'???'
+									);
+									return array( $query, $args, 'too few arguments supplied for the given number of placeholders' );
+								}
+							}
+							// break the switch and the next outer loop
+							break 2;
+						} elseif ( '.' === $parse_char ) {
+							// Jump straight to precision
+							$parser_state = $parser_state ^ 4;
+						} elseif ( ctype_digit( $parse_char ) ) {
+							// still width
+							break;
+						} else {
+							// seems to be invalid. Append the buffer to the new query
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							// break out of this switch and the mini parser
+							break 2;
+						}
+						break;
+					case 2 | 4 | 8 | 16:
+						// This can be flags | width | precision | specifier
+						if ( in_array( $parse_char, $valid_specifiers, true ) ) {
+
+							$placeholders++;
+							// we have reached the end of the road. Append the buffer to the new query.
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							if ( '%' === $parse_char ) {
+								// this was a really, really, really long winded (but valid) method of escaping a %
+								// no variable is used.
+
+								// for some reason vsprintf needs a placeholder for (as an example) %'%% but not %% 
+								$placeholders++;
+								break 2;
+							}
+							if ( false === $argnum_found ) {
+								// append the referenced arg to the new args
+								if ( array_key_exists( $current_arg, $args ) ) {
+									if ( null === $args_vsprintf ) {
+										// now we know
+
+										$args_vsprintf = true;
+										$args          = $args[0];
+									}
+									$new_args[] = $args[ $current_arg ];
+									$current_arg++;
+								} else {
+									wp_load_translations_early();
+									_doing_it_wrong(
+										'wpdb::_prepare_implode',
+										__( 'too few arguments supplied for the given number of placeholders' ),
+										'???'
+									);
+									return array( $query, $args, 'too few arguments supplied for the given number of placeholders' );
+								}
+							}
+							// break the switch and the next outer loop
+							break 2;
+						} elseif ( '.' === $parse_char ) {
+							// Jump straight to precision
+							$parser_state = $parser_state ^ 2 | 4;
+						} elseif ( in_array( $parse_char, $valid_flags, true ) ) {
+							if ( "'" === $parse_char ) {
+
+								// special case... the next character can be anything and will be used for padding.
+								$buffer .= $query[ $i + 1 ];
+								$i++;
+							}
+						} elseif ( ctype_digit( $parse_char ) ) {
+							// Jump straight to width
+							$parser_state = $parser_state ^ 2;
+						} else {
+							// seems to be invalid. Append the buffer to the new query
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							// break out of this switch and the mini parser
+							break 2;
+						}
+						break;
+
+					case 1 | 2 | 4 | 8 | 16:
+						// argnum | flags | width | precision | specifier
+						if ( in_array( $parse_char, $valid_specifiers, true ) ) {
+
+							$placeholders++;
+							// we have reached the end of the road. Append the buffer to the new query.
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							if ( '%' === $parse_char ) {
+								// this was a really, really, really long winded (but valid) method of escaping a %
+								// no variable is used.
+
+								// for some reason vsprintf needs a placeholder for (as an example) %'%% but not %% 
+								$placeholders++;
+								break 2;
+							}
+							if ( false !== $argnum_found ) {
+								// append the referenced arg to the new args
+								if ( array_key_exists( $current_arg, $args ) ) {
+									if ( null === $args_vsprintf ) {
+										// now we know
+
+										$args_vsprintf = true;
+										$args          = $args[0];
+									}
+									$new_args[] = $args[ $current_arg ];
+									$current_arg++;
+								} else {
+									wp_load_translations_early();
+									_doing_it_wrong(
+										'wpdb::_prepare_implode',
+										__( 'too few arguments supplied for the given number of placeholders' ),
+										'???'
+									);
+									return array( $query, $args, 'too few arguments supplied for the given number of placeholders' );
+								}
+							}
+							// break the switch and the next outer loop
+							break 2;
+						} elseif ( '.' === $parse_char ) {
+							// Jump straight to precision
+							$parser_state = $parser_state ^ 1 | 2 | 4;
+						} elseif ( in_array( $parse_char, $valid_flags, true ) ) {
+							if ( "'" === $parse_char ) {
+
+								// special case... the next character can be anything and will be used for padding.
+								$buffer .= $query[ $i + 1 ];
+								$i++;
+							}
+							// Jump straight to flags
+							$parser_state = $parser_state ^ 1;
+						} elseif ( ctype_digit( $parse_char ) ) {
+							if ( '0' === $parse_char ) {
+								// this can't be a argnum anymore because those start at 1, not 0.
+								// tested with vsprintf()
+								$parser_state = $parser_state ^ 1;
+							}
+						} elseif ( '$' === $parse_char ) {
+							// this terminates an argnum. Honestly this is the entire reason this functions parser is so complicated.
+							$reference = substr( $buffer, 0, -1 );
+							if ( ! ctype_digit( $reference ) ) {
+								wp_load_translations_early();
+								_doing_it_wrong(
+									'wpdb::prepare',
+									sprintf(
+										__( 'The query contains an invalid argnum reference (%s)' ),
+										"%$buffer"
+									),
+									'4.8.3'
+								);
+								return array( false, false, "invalid argnum specified: '$reference'" );
+							}
+							$reference = intval( $reference );
+							// fun fact argnum references start from 1, not 0. Adjust for that
+							$reference--;
+							if ( ! array_key_exists( $reference, $args ) ) {
+								wp_load_translations_early();
+								_doing_it_wrong(
+									'wpdb::_prepare_implode',
+									__( 'too few arguments supplied for the given number of placeholders' ),
+									'???'
+								);
+								return array( $query, $args, "argnum referenced an invalid argument: '$reference'" );
+							}
+							// record the position in the new query string we are at currently, along with the '{argnum}$'
+							// in the buffer, and the arg array index being referenced. We will use this information to
+							// replace the argnum reference with a reassigned variable. new_query position + 1 to account
+							// for the % being looked at but not yet in the string
+
+							$argnum_reassignment[ strlen( $new_query ) + 1 ] = array(
+								'from' => $buffer,
+								'arg'  => $reference,
+							);
+							// Tell the parser that we do not want to attempt to use the next arg for this. That arg is
+							// for real placeholders and not argnum referenced placeholders
+							$argnum_found = true;
+							// we are no longer possibly parsing an argnum
+							$parser_state = $parser_state ^ 1;
+						} else {
+							// seems to be invalid. Append the buffer to the new query
+							$new_query .= '%' . $buffer;
+							$position  += strlen( $buffer );
+							// break out of this switch and the mini parser
+							break 2;
+						}
+						break;
+				}
+			}
+		}
+		// see if we have any dangling used bits from the query perhaps if we were cut off in the middle
+		// of some vsprintf identifier parsing
+		$remainder = substr( $query, $position );
+		if ( ! empty( $remainder ) ) {
+
+			$new_query .= $remainder;
+		}
+
+		// add any missing arguments from the args array to the new_args array.
+		if ( null === $args_vsprintf ) {
+			// now we know
+
+			$args_vsprintf = true;
+			$args          = $args[0];
+		}
+
+		// Since we "fix" things here which would otherwise causes errors in the outside prepare...
+		// we need to handle those things here
+		foreach ( $new_args as $arg ) {
+			if ( ! is_scalar( $arg ) && ! is_null( $arg ) ) {
+				wp_load_translations_early();
+				_doing_it_wrong(
+					'wpdb::prepare',
+					sprintf(
+						/* translators: %s: Value type. */
+						__( 'Unsupported value type (%s).' ),
+						gettype( $arg )
+					),
+					'4.8.2'
+				);
+			}
+		}
+
+		if ( $placeholders !== count( $args ) ) {
+
+
+			wp_load_translations_early();
+			_doing_it_wrong(
+				'wpdb::_prepare_implode',
+				__( 'The query does not contain the correct number of placeholders for the number of arguments passed.' ),
+				'???'
+			);
+			return array( $query, $args, 'The query does not contain the correct number of placeholders for the number of arguments passed.' );
+		}
+
+		$last_non_argnum_arg = count( $args ) - count( $argnum_reassignment );
+		for ( $i = $current_arg; $i < $last_non_argnum_arg; $i++ ) {
+
+			$new_args[] = $args[ $i ];
+			$current_arg++;
+		}
+		// Quickly adjust the argnum references. Work backwards to make string offset the math less difficult
+		foreach ( array_reverse( array_keys( $argnum_reassignment ) ) as $argnum_position ) {
+			$argnum = $argnum_reassignment[ $argnum_position ];
+			if ( ! array_key_exists( $current_arg, $args ) ) {
+
+				wp_load_translations_early();
+				_doing_it_wrong(
+					'wpdb::_prepare_implode',
+					__( 'too few arguments passed' ),
+					'???'
+				);
+				return array( $query, $args, 'too few arguments passed' );
+			}
+			// Append the referenced argument to the new argument array
+			$new_args[] = $args[ $argnum['arg'] ];
+			// Replace the old reference text with new text which references the new array element.
+			$new_query = sprintf(
+				'%s%s%s',
+				substr( $new_query, 0, $argnum_position ),
+				sprintf( '%d$', count( $new_args ) ),
+				substr( $new_query, $argnum_position + strlen( $argnum['from'] ) )
+			);
+
+		}
+
+
+
+		return array( $new_query, $new_args );
+	}
+
+	/**
 	 * Prepares a SQL query for safe execution.
 	 *
 	 * Uses sprintf()-like syntax. The following placeholders can be used in the query string:
@@ -1409,6 +1950,14 @@ class wpdb {
 				),
 				'3.9.0'
 			);
+		}
+
+		if ( preg_match( '/(?:[^%]|^)%,[dfs]/', $query, $matches ) ) {
+			$imploded = $this->_prepare_implode( $query, ...$args );
+			if ( is_array( $imploded ) && 2 === count( $imploded ) ) {
+				$query = $imploded[0];
+				$args  = $imploded[1];
+			}
 		}
 
 		// If args were passed as an array (as in vsprintf), move them up.
